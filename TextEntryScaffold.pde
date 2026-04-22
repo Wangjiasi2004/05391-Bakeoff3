@@ -1,37 +1,16 @@
+import java.io.BufferedReader;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.Random;
 import java.util.HashMap;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
+import java.util.Random;
 
-// =================================================================
-// PROTOTYPE 2 — Ambiguous (T9-style) 6-group keyboard + expanded
-// dynamic autocomplete.
-//
-// Inside the 1" area:
-//   [ sugg1 ][ sugg2 ][ sugg3 ]   <- 3 autocomplete chips
-//   [ abcd ][ efgh ][ ijklm  ]
-//   [ nopqr][ stuv ][ wxyz   ]
-//   [ space         ][ del    ]
-//
-// One tap per letter (group key). Suggestions are computed by
-// matching the group sequence against a dictionary, ranked by
-// unigram frequency. When no letters have been typed yet in the
-// new word, suggestions are seeded by bigram context (most-likely
-// next word after the last committed word).
-//
-// A "raw" chip (literal first-letter-of-each-group the user typed)
-// is always available in the chip row so the user can type words
-// not in the dictionary.
-// =================================================================
+// Set the DPI to make your smartwatch 1 inch square. Measure it on the screen.
+final int DPIofYourDeviceScreen = 125;
 
-// Set the DPI to make your smartwatch 1 inch square.
-final int DPIofYourDeviceScreen = 250;
-
-//Do not change the following variables
+// Do not change the following variables.
 String[] phrases;
+String[] suggestions;
 int totalTrialNum = 3 + (int)random(3);
 int currTrialNum = 0;
 float startTime = 0;
@@ -42,415 +21,2239 @@ float lettersExpectedTotal = 0;
 float errorsTotal = 0;
 String currentPhrase = "";
 String currentTyped = "";
-final float sizeOfInputArea = DPIofYourDeviceScreen*1;
+final float sizeOfInputArea = DPIofYourDeviceScreen * 1;
 PImage watch;
 PImage mouseCursor;
 float cursorHeight;
 float cursorWidth;
 
-// ----- Prototype state -----
-ArrayList<Integer> groupSeq = new ArrayList<Integer>();
-String lastCommittedWord = "";
-String[] currentSuggestions = new String[3];
+// Predictive input mapped to QWERTY groups. Each tap records a letter group.
+// The current sequence is converted to the most likely word.
+final String[] T9_DIGITS = {
+  "2", "3", "4",
+  "5", "6", "7",
+  "8", "9"
+};
 
-// Dictionaries
-HashMap<String, Long> unigramFreq;
-ArrayList<String> unigramSorted;
-HashMap<String, ArrayList<String>> bigramNext;
-// Map: group-code string ("3-0-4") -> freq-desc list of matching words
-HashMap<String, ArrayList<String>> groupLookup;
+final String[] T9_LABELS = {
+  "QWE", "RTY", "UIOP",
+  "ASD", "FGH", "JKL",
+  "ZXCV", "BNM"
+};
 
-// Letter groups (6 groups cover a-z)
-final String[] GROUPS = {"abcd", "efgh", "ijklm", "nopqr", "stuv", "wxyz"};
+final String[] T9_LETTERS = {
+  "qwe", "rty", "uiop",
+  "asd", "fgh", "jkl",
+  "zxcv", "bnm"
+};
 
-// Fonts
-PFont fontKey;
-PFont fontSuggest;
-PFont fontUI;
+final int ACTION_NONE = 0;
+final int ACTION_DELETE = 1;
+final int ACTION_SPACE = 2;
+final int ACTION_PREDICT_BASE = 10;
+final int ACTION_T9_BASE = 100;
 
-// Layout
-float inputLeft, inputTop;
-float suggH, letterH, bottomH;
+final int CANDIDATE_SLOTS = 6;
+final int PREDICTION_TILE_COUNT = 4;
+final int BUCKET_CAPACITY = 18;
+final int MAX_UNIGRAM_WORDS = 400000;
+final int MAX_DICTIONARY_WORD_LENGTH = 14;
+final int MAX_WORD_DIGITS = 14;
+final int BEAM_WIDTH = 10;
+final int SEGMENT_BEAM_WIDTH = 12;
+final float CONTEXT_SCORE_MULTIPLIER = 2.35;
+final float PAIR_CONTEXT_SCORE_MULTIPLIER = 2.80;
+final float CONTEXT_PREFIX_SCORE_MULTIPLIER = 1.85;
+final float PAIR_CONTEXT_PREFIX_SCORE_MULTIPLIER = 2.20;
+final float UNIGRAM_SCORE_MULTIPLIER = 1.00;
+final float PREFIX_SCORE_MULTIPLIER = 0.95;
+final float PREFIX_EXTRA_LETTER_PENALTY = 0.16;
+final float SINGLE_GROUP_PREFIX_MULTIPLIER = 1.18;
+final float EXACT_WORD_SCORE_BONUS = 0.40;
+final float SHORT_EXACT_WORD_BONUS = 0.40;
+final float WORD_BREAK_PENALTY = 4.0;
+final float WORD_LENGTH_BONUS = 0.05;
+final float WHOLE_INPUT_WORD_BONUS = 0.40;
+final float ONE_LETTER_WORD_BONUS = 0.0;
+final long COUNT_BIG_MULTIPLIER = 1500L;
+final long DICTIONARY_WORD_COUNT = 1200L;
+final long STRONG_PREFIX_COUNT = 1000000L;
+final long MIN_TRUSTED_UNIGRAM_COUNT = 10000L;
+final long MIN_PLURAL_SOURCE_COUNT = 10000L;
+final float UNIGRAM_LOG_CAP = 17.20;
+final float COMMON_WORD_SCORE_WEIGHT = 0.35;
+final float JOINT_UNIGRAM_WEIGHT = 1.00;
+final float JOINT_BIGRAM_WEIGHT = 1.40;
+final float JOINT_PREFIX_WEIGHT = 0.30;
+final float JOINT_SKELETON_WEIGHT = 0.70;
+final float JOINT_CHAR_NGRAM_WEIGHT = 0.15;
+final float JOINT_EDIT_PENALTY_WEIGHT = 5.00;
+final float BIGRAM_SMOOTHING = 1.0;
+final float BIGRAM_LOG_CAP = 3.50;
+final float PREFIX_EXTENSION_DIGIT_COST = 0.60;
 
-// Flash feedback
-long lastKeyFlashTime = 0;
-int lastKeyFlashed = -1;
-int lastSpecialFlash = 0; // 1 = space, 2 = del
+HashMap<String, CandidateBucket> sequenceBuckets = new HashMap<String, CandidateBucket>();
+HashMap<String, CandidateBucket> prefixSequenceBuckets = new HashMap<String, CandidateBucket>();
+HashMap<String, CandidateBucket> contextSequenceBuckets = new HashMap<String, CandidateBucket>();
+HashMap<String, CandidateBucket> contextPrefixSequenceBuckets = new HashMap<String, CandidateBucket>();
+HashMap<String, CandidateBucket> nextWordBuckets = new HashMap<String, CandidateBucket>();
+HashMap<String, CandidateBucket> skeletonSequenceBuckets = new HashMap<String, CandidateBucket>();
+HashMap<String, CandidateBucket> skeletonPrefixSequenceBuckets = new HashMap<String, CandidateBucket>();
+HashMap<String, Float> letterNgramScores = new HashMap<String, Float>();
+HashMap<String, Long> sequencePrefixCounts = new HashMap<String, Long>();
+HashMap<String, Long> unigramCounts = new HashMap<String, Long>();
+HashMap<String, Long> commonWordCounts = new HashMap<String, Long>();
+HashMap<String, Long> bigramCounts = new HashMap<String, Long>();
+HashMap<String, Boolean> dictionaryWords = new HashMap<String, Boolean>();
+CandidateBucket fallbackPredictionBucket = new CandidateBucket();
+String[] visibleCandidates = new String[CANDIDATE_SLOTS];
+
+String committedTyped = "";
+String t9Sequence = "";
+String livePrediction = "";
+int selectedCandidateIndex = 0;
+int activeTapAction = ACTION_NONE;
 
 void setup()
 {
   watch = loadImage("watchhand3smaller.png");
   phrases = loadStrings("phrases2.txt");
   Collections.shuffle(Arrays.asList(phrases), new Random());
+  loadLanguageModel();
+  clearVisibleCandidates();
 
   orientation(LANDSCAPE);
   size(800, 800);
-
-  fontKey = createFont("Arial Bold", 18);
-  fontSuggest = createFont("Arial", 15);
-  fontUI = createFont("Arial", 24);
-  textFont(fontUI);
+  textFont(createFont("Arial", 24));
   noStroke();
 
   noCursor();
   mouseCursor = loadImage("finger.png");
-  cursorHeight = DPIofYourDeviceScreen * (400.0/250.0);
+  cursorHeight = DPIofYourDeviceScreen * (400.0 / 250.0);
   cursorWidth = cursorHeight * 0.6;
-
-  inputLeft = width/2 - sizeOfInputArea/2;
-  inputTop  = height/2 - sizeOfInputArea/2;
-  suggH   = sizeOfInputArea * 0.22;
-  letterH = sizeOfInputArea * 0.29;
-  bottomH = sizeOfInputArea - suggH - 2*letterH;
-
-  loadDictionaries();
-  buildGroupLookup();
-  updateSuggestions();
-}
-
-int groupOf(char c)
-{
-  for (int i = 0; i < GROUPS.length; i++)
-    if (GROUPS[i].indexOf(c) >= 0) return i;
-  return -1;
-}
-
-String wordToGroupCode(String w)
-{
-  StringBuilder sb = new StringBuilder();
-  for (int i = 0; i < w.length(); i++) {
-    int g = groupOf(w.charAt(i));
-    if (g < 0) return null;
-    if (i > 0) sb.append('-');
-    sb.append(g);
-  }
-  return sb.toString();
-}
-
-void loadDictionaries()
-{
-  unigramFreq = new HashMap<String, Long>();
-  unigramSorted = new ArrayList<String>();
-  bigramNext = new HashMap<String, ArrayList<String>>();
-
-  String[] uni = loadStrings("uni_small.txt");
-  for (int i = 0; i < uni.length; i++) {
-    String[] parts = uni[i].split("\t");
-    if (parts.length < 2) continue;
-    String w = parts[0];
-    long c;
-    try { c = Long.parseLong(parts[1]); } catch (Exception e) { continue; }
-    unigramFreq.put(w, c);
-    unigramSorted.add(w);
-  }
-
-  String[] bi = loadStrings("bi_small.txt");
-  for (int i = 0; i < bi.length; i++) {
-    String[] parts = bi[i].split("\t");
-    if (parts.length < 3) continue;
-    String a = parts[0], b = parts[1];
-    ArrayList<String> lst = bigramNext.get(a);
-    if (lst == null) { lst = new ArrayList<String>(); bigramNext.put(a, lst); }
-    lst.add(b);
-  }
-  println("Loaded " + unigramFreq.size() + " unigrams, " + bigramNext.size() + " bigram heads.");
-}
-
-void buildGroupLookup()
-{
-  groupLookup = new HashMap<String, ArrayList<String>>();
-  for (String w : unigramSorted) {
-    String code = wordToGroupCode(w);
-    if (code == null) continue;
-    ArrayList<String> lst = groupLookup.get(code);
-    if (lst == null) { lst = new ArrayList<String>(); groupLookup.put(code, lst); }
-    lst.add(w);
-  }
-  println("Built group lookup with " + groupLookup.size() + " buckets.");
-}
-
-String currentCode()
-{
-  StringBuilder sb = new StringBuilder();
-  for (int i = 0; i < groupSeq.size(); i++) {
-    if (i > 0) sb.append('-');
-    sb.append(groupSeq.get(i));
-  }
-  return sb.toString();
-}
-
-// Literal fallback: first letter of each group the user tapped.
-String rawFirstLetters()
-{
-  StringBuilder sb = new StringBuilder();
-  for (int g : groupSeq) sb.append(GROUPS[g].charAt(0));
-  return sb.toString();
-}
-
-void updateSuggestions()
-{
-  ArrayList<String> picks = new ArrayList<String>();
-
-  if (groupSeq.size() == 0) {
-    // Seed from bigrams following lastCommittedWord
-    if (lastCommittedWord.length() > 0 && bigramNext.containsKey(lastCommittedWord)) {
-      for (String w : bigramNext.get(lastCommittedWord)) {
-        if (picks.size() >= 3) break;
-        picks.add(w);
-      }
-    }
-    for (int i = 0; i < unigramSorted.size() && picks.size() < 3; i++) {
-      String w = unigramSorted.get(i);
-      if (!picks.contains(w)) picks.add(w);
-    }
-  } else {
-    // Exact length matches first
-    String code = currentCode();
-    ArrayList<String> exact = groupLookup.get(code);
-    if (exact != null) {
-      for (int i = 0; i < exact.size() && picks.size() < 3; i++) picks.add(exact.get(i));
-    }
-    // Then longer prefix matches (completion)
-    if (picks.size() < 3) {
-      String pref = code + "-";
-      for (int i = 0; i < unigramSorted.size() && picks.size() < 3; i++) {
-        String w = unigramSorted.get(i);
-        if (w.length() <= groupSeq.size()) continue;
-        String c2 = wordToGroupCode(w);
-        if (c2 != null && c2.startsWith(pref) && !picks.contains(w)) picks.add(w);
-      }
-    }
-    // Always guarantee a raw fallback is on screen
-    String raw = rawFirstLetters();
-    if (!picks.contains(raw)) {
-      if (picks.size() < 3) picks.add(raw);
-      else picks.set(2, raw);
-    }
-  }
-
-  for (int i = 0; i < 3; i++)
-    currentSuggestions[i] = (i < picks.size()) ? picks.get(i) : "";
 }
 
 void draw()
 {
   background(255);
   drawWatch();
+  drawInputArea();
 
-  fill(40);
-  rect(inputLeft, inputTop, sizeOfInputArea, sizeOfInputArea);
-
-  if (finishTime != 0) {
+  if (finishTime != 0)
+  {
     fill(128);
-    textFont(fontUI);
     textAlign(CENTER);
     text("Finished", 280, 150);
     cursor(ARROW);
     return;
   }
 
-  if (startTime == 0 & !mousePressed) {
+  if (startTime == 0 && !mousePressed)
+  {
     fill(128);
-    textFont(fontUI);
     textAlign(CENTER);
     text("Click to start time!", 280, 150);
   }
-  if (startTime == 0 & mousePressed) {
+
+  if (startTime == 0 && mousePressed)
     nextTrial();
-  }
 
-  if (startTime != 0) {
-    textFont(fontUI);
-    textAlign(LEFT);
-    fill(128);
-    text("Phrase " + (currTrialNum+1) + " of " + totalTrialNum, 70, 50);
-    text("Target:   " + currentPhrase, 70, 100);
-    String preview = currentTyped;
-    if (groupSeq.size() > 0) preview += "[" + rawFirstLetters() + "]";
-    text("Entered:  " + preview + "|", 70, 140);
+  if (startTime != 0)
+    drawOutsideUI();
 
-    // NEXT button (kept white/plain per rules)
-    fill(255);
-    rect(600, 600, 200, 200);
-    fill(0);
-    textAlign(CENTER);
-    text("NEXT >", 700, 710);
-
-    drawKeyboard();
-  }
-
-  image(mouseCursor, mouseX+cursorWidth/2-cursorWidth/3, mouseY+cursorHeight/2-cursorHeight/5, cursorWidth, cursorHeight);
+  image(mouseCursor, mouseX + cursorWidth / 2 - cursorWidth / 3, mouseY + cursorHeight / 2 - cursorHeight / 5, cursorWidth, cursorHeight);
 }
 
-void drawKeyboard()
+void drawInputArea()
 {
-  // Suggestion chips
-  float sx = inputLeft;
-  float sy = inputTop;
-  float sw = sizeOfInputArea / 3.0;
-  textFont(fontSuggest);
-  textAlign(CENTER, CENTER);
-  for (int i = 0; i < 3; i++) {
-    fill(70, 130, 180);
-    rect(sx + i*sw + 1, sy + 1, sw - 2, suggH - 2, 5);
-    fill(255);
-    String s = currentSuggestions[i];
-    if (s != null && s.length() > 10) s = s.substring(0, 10);
-    text(s == null ? "" : s, sx + i*sw + sw/2, sy + suggH/2);
-  }
+  refreshT9Preview();
 
-  // Letter-group keys (2 rows of 3)
-  textFont(fontKey);
-  float kW = sizeOfInputArea / 3.0;
-  for (int r = 0; r < 2; r++) {
-    for (int c = 0; c < 3; c++) {
-      int idx = r*3 + c;
-      float x = inputLeft + c*kW;
-      float y = inputTop + suggH + r*letterH;
-      boolean flash = (idx == lastKeyFlashed) && (millis() - lastKeyFlashTime < 120);
-      fill(flash ? color(255, 220, 90) : 245);
-      rect(x + 1, y + 1, kW - 2, letterH - 2, 5);
-      fill(20);
-      text(GROUPS[idx], x + kW/2, y + letterH/2);
+  fill(34);
+  rect(inputLeft(), inputTop(), sizeOfInputArea, sizeOfInputArea, 18);
+  fill(50);
+  rect(inputLeft() + 4, inputTop() + 4, sizeOfInputArea - 8, sizeOfInputArea - 8, 15);
+
+  drawHomeKeyboard();
+}
+
+void drawHomeKeyboard()
+{
+  int hoverAction = hoveredAction();
+  textAlign(CENTER, CENTER);
+  drawTopStrip(hoverAction);
+
+  for (int row = 0; row < 3; row++)
+  {
+    for (int col = 0; col < 3; col++)
+    {
+      int action = keyboardActionAt(row, col);
+      float x = keyboardCellLeft(col) + buttonInset();
+      float y = keyboardCellTop(row) + buttonInset();
+      float w = keyboardCellWidth() - buttonInset() * 2;
+      float h = keyboardCellHeight() - buttonInset() * 2;
+      boolean isPressed = action == activeTapAction;
+      boolean isHighlighted = isPressed || hoverAction == action;
+
+      fill(homeButtonColor(action, true, isHighlighted));
+      rect(x, y, w, h, 10);
+
+      if (action == ACTION_SPACE)
+        drawSpaceKey(x, y, w, h, isHighlighted);
+      else
+        drawT9Key(action - ACTION_T9_BASE, x, y, w, h, isHighlighted);
     }
   }
+}
 
-  // Bottom row: space (2/3) + delete (1/3)
-  float by = inputTop + suggH + 2*letterH;
-  float spaceW = sizeOfInputArea * (2.0/3.0);
-  float delW = sizeOfInputArea - spaceW;
-  boolean flashSpace = (lastSpecialFlash == 1) && (millis() - lastKeyFlashTime < 120);
-  boolean flashDel   = (lastSpecialFlash == 2) && (millis() - lastKeyFlashTime < 120);
-  fill(flashSpace ? color(255, 220, 90) : 210);
-  rect(inputLeft + 1, by + 1, spaceW - 2, bottomH - 2, 5);
-  fill(30);
-  textFont(fontSuggest);
-  textAlign(CENTER, CENTER);
-  text("space", inputLeft + spaceW/2, by + bottomH/2);
+void drawTopStrip(int hoverAction)
+{
+  float topY = inputTop() + buttonInset();
+  float topH = topStripHeight() - buttonInset() * 2;
+  float deleteX = inputLeft() + buttonInset();
+  float deleteW = keyboardCellWidth() - buttonInset() * 2;
+  boolean deletePressed = activeTapAction == ACTION_DELETE;
+  boolean deleteHighlighted = deletePressed || hoverAction == ACTION_DELETE;
 
-  fill(flashDel ? color(255, 220, 90) : color(180, 60, 60));
-  rect(inputLeft + spaceW + 1, by + 1, delW - 2, bottomH - 2, 5);
+  fill(homeButtonColor(ACTION_DELETE, true, deleteHighlighted));
+  rect(deleteX, topY, deleteW, topH, 10);
+  fill(deleteHighlighted ? color(20) : color(248));
+  textSize(13);
+  text("del", deleteX + deleteW / 2, topY + topH / 2 + 1);
+
+  for (int i = 0; i < PREDICTION_TILE_COUNT; i++)
+  {
+    int action = ACTION_PREDICT_BASE + i;
+    float x = predictionTileLeft(i) + buttonInset();
+    float y = predictionTileTop(i) + buttonInset();
+    float w = predictionTileWidth() - buttonInset() * 2;
+    float h = predictionTileHeight() - buttonInset() * 2;
+    boolean enabled = predictionEnabled(i);
+    boolean isPressed = activeTapAction == action;
+    boolean isHighlighted = enabled && (isPressed || hoverAction == action);
+
+    fill(homeButtonColor(action, enabled, isHighlighted));
+    rect(x, y, w, h, 8);
+    drawPredictionTile(i, x, y, w, h, enabled, isHighlighted);
+  }
+}
+
+void drawPredictionTile(int index, float x, float y, float w, float h, boolean enabled, boolean isPressed)
+{
+  if (!enabled)
+    return;
+
+  String label = visibleCandidates[index];
+  fill(isPressed ? color(20) : color(250));
+  int labelSize = predictionTileLabelSize(label);
+  textSize(labelSize);
+  text(fitLabel(label, w - 5, labelSize), x + w / 2, y + h / 2 + 1);
+}
+
+void drawT9Key(int keyIndex, float x, float y, float w, float h, boolean isPressed)
+{
+  if (keyIndex < 0 || keyIndex >= T9_LABELS.length)
+    return;
+
+  fill(isPressed ? color(20) : color(248));
+  textSize(T9_LABELS[keyIndex].length() == 4 ? 13 : 14);
+  text(T9_LABELS[keyIndex], x + w / 2, y + h / 2 + 1);
+}
+
+void drawSpaceKey(float x, float y, float w, float h, boolean isPressed)
+{
+  fill(isPressed ? color(20) : color(248));
+  textSize(12);
+  text("space", x + w / 2, y + h / 2 + 1);
+}
+
+void drawOutsideUI()
+{
+  syncCurrentTyped();
+  
+  textSize(24);
+
+  textAlign(LEFT); // align the text left
+  fill(128);
+  text("Phrase " + (currTrialNum+1) + " of " + totalTrialNum, 70, 50); // draw the trial count
+  fill(128);
+  text("Target:   " + currentPhrase, 70, 100); // draw the target string
+  text("Entered:  " + currentTyped +"|", 70, 140); // draw what the user has entered thus far 
+
+  // draw very basic next button
+  fill(255, 0, 0);
+  rect(600, 600, 200, 200); // draw next button
   fill(255);
-  text("del", inputLeft + spaceW + delW/2, by + bottomH/2);
+  text("NEXT > ", 650, 650); // draw next label
 }
 
 boolean didMouseClick(float x, float y, float w, float h)
 {
-  return (mouseX > x && mouseX<x+w && mouseY>y && mouseY<y+h);
+  return mouseX > x && mouseX < x + w && mouseY > y && mouseY < y + h;
 }
 
 void mousePressed()
 {
-  if (finishTime != 0) return;
+  if (finishTime != 0)
+    return;
 
-  // NEXT (outside 1" area)
-  if (didMouseClick(600, 600, 200, 200)) { nextTrial(); return; }
+  if (didMouseClick(600, 600, 200, 200))
+  {
+    nextTrial();
+    return;
+  }
 
-  if (startTime == 0) return;
+  if (startTime == 0)
+    return;
 
-  // Suggestion chips
-  float sx = inputLeft, sy = inputTop;
-  float sw = sizeOfInputArea / 3.0;
-  for (int i = 0; i < 3; i++) {
-    if (didMouseClick(sx + i*sw, sy, sw, suggH)) {
-      String pick = currentSuggestions[i];
-      if (pick != null && pick.length() > 0) {
-        currentTyped += pick + " ";
-        lastCommittedWord = pick;
-        groupSeq.clear();
-        updateSuggestions();
+  if (!isInsideInput(mouseX, mouseY))
+    return;
+
+  int action = touchActionAt(mouseX, mouseY);
+  if (action == ACTION_NONE)
+    return;
+
+  activeTapAction = action;
+}
+
+void mouseReleased()
+{
+  if (activeTapAction == ACTION_NONE)
+    return;
+
+  int releasedAction = touchActionAt(mouseX, mouseY);
+
+  if (releasedAction == activeTapAction)
+    handleTapAction(activeTapAction);
+
+  activeTapAction = ACTION_NONE;
+}
+
+void handleTapAction(int action)
+{
+  if (action == ACTION_DELETE)
+  {
+    deleteOneStep();
+    return;
+  }
+
+  if (action == ACTION_SPACE)
+  {
+    commitT9Word();
+    return;
+  }
+
+  if (isPredictionAction(action))
+  {
+    applyPrediction(action - ACTION_PREDICT_BASE);
+    return;
+  }
+
+  if (action >= ACTION_T9_BASE)
+  {
+    int keyIndex = action - ACTION_T9_BASE;
+    if (keyIndex >= 0 && keyIndex < T9_DIGITS.length)
+    {
+      t9Sequence += T9_DIGITS[keyIndex];
+      selectedCandidateIndex = 0;
+    }
+  }
+
+  refreshT9Preview();
+}
+
+void deleteOneStep()
+{
+  // If we are currently typing a word, just delete the last T9 digit
+  if (t9Sequence.length() > 0)
+  {
+    t9Sequence = t9Sequence.substring(0, t9Sequence.length() - 1);
+    selectedCandidateIndex = 0;
+    refreshT9Preview();
+    return;
+  }
+
+  // If we aren't typing an active word, we need to edit the committed text
+  if (committedTyped.length() > 0)
+  {
+    boolean hadTrailingSpace = false;
+
+    // 1. Check for and remove the trailing space
+    if (committedTyped.charAt(committedTyped.length() - 1) == ' ') 
+    {
+      committedTyped = committedTyped.substring(0, committedTyped.length() - 1);
+      hadTrailingSpace = true;
+    }
+
+    if (committedTyped.length() > 0) 
+    {
+      // 2. Extract the last word so we can make it active again
+      int lastSpaceIndex = committedTyped.lastIndexOf(' ');
+      String lastWord = "";
+
+      if (lastSpaceIndex >= 0) 
+      {
+        lastWord = committedTyped.substring(lastSpaceIndex + 1);
+      } 
+      else 
+      {
+        lastWord = committedTyped;
+      }
+
+      // 3. Convert the extracted word back into a T9 sequence
+      String newSequence = t9SequenceForWord(lastWord);
+
+      if (newSequence.length() > 0) 
+      {
+        // Make the sequence active
+        t9Sequence = newSequence;
+
+        // Remove the newly active word from committedTyped
+        if (lastSpaceIndex >= 0) {
+          committedTyped = committedTyped.substring(0, lastSpaceIndex + 1);
+        } else {
+          committedTyped = "";
+        }
+
+        // 4. If there was NO trailing space, it means we need to actually delete a character
+        if (!hadTrailingSpace) 
+        {
+          t9Sequence = t9Sequence.substring(0, t9Sequence.length() - 1);
+        }
+
+        selectedCandidateIndex = 0;
+        refreshT9Preview();
+      } 
+      else 
+      {
+        // Fallback: If sequence conversion fails, just delete a character from committedTyped
+        if (!hadTrailingSpace) 
+        {
+          committedTyped = committedTyped.substring(0, committedTyped.length() - 1);
+        }
+      }
+    }
+  }
+
+  syncCurrentTyped();
+}
+
+void commitT9Word()
+{
+  refreshT9Preview();
+
+  if (t9Sequence.length() > 0)
+  {
+    String word = livePrediction;
+    if (word == null || word.length() == 0)
+      word = fallbackWordFromSequence(t9Sequence);
+
+    appendCommittedPrediction(word);
+    t9Sequence = "";
+    livePrediction = "";
+    selectedCandidateIndex = 0;
+    clearVisibleCandidates();
+    syncCurrentTyped();
+    return;
+  }
+
+  if (committedTyped.length() > 0 && committedTyped.charAt(committedTyped.length() - 1) == ' ' && predictionEnabled(0))
+  {
+    appendCommittedPrediction(visibleCandidates[0]);
+    clearVisibleCandidates();
+    syncCurrentTyped();
+    return;
+  }
+
+  if (committedTyped.length() > 0 && committedTyped.charAt(committedTyped.length() - 1) != ' ')
+    committedTyped += " ";
+
+  syncCurrentTyped();
+}
+
+void applyPrediction(int index)
+{
+  refreshT9Preview();
+
+  if (!predictionEnabled(index))
+    return;
+
+  String prediction = visibleCandidates[index];
+  if (prediction == null || prediction.length() == 0)
+    return;
+
+  appendCommittedPrediction(prediction);
+  t9Sequence = "";
+  livePrediction = "";
+  selectedCandidateIndex = 0;
+  clearVisibleCandidates();
+  syncCurrentTyped();
+}
+
+void appendCommittedPrediction(String prediction)
+{
+  String cleaned = prediction.trim();
+  if (cleaned.length() == 0)
+    return;
+
+  if (committedTyped.length() > 0 && committedTyped.charAt(committedTyped.length() - 1) != ' ')
+    committedTyped += " ";
+
+  committedTyped += cleaned;
+  if (committedTyped.charAt(committedTyped.length() - 1) != ' ')
+    committedTyped += " ";
+}
+
+void refreshT9Preview()
+{
+  clearVisibleCandidates();
+
+  if (t9Sequence.length() == 0)
+  {
+    fillNextWordPredictions();
+    livePrediction = "";
+    selectedCandidateIndex = 0;
+    syncCurrentTyped();
+    return;
+  }
+
+  String[] candidates = computeVisibleSuggestions();
+  fillCurrentTypingPredictions(candidates);
+
+  int count = visibleCandidateCount();
+  if (selectedCandidateIndex >= count)
+    selectedCandidateIndex = 0;
+
+  livePrediction = visibleCandidates[selectedCandidateIndex];
+  if (livePrediction == null || livePrediction.length() == 0)
+    livePrediction = fallbackWordFromSequence(t9Sequence);
+
+  syncCurrentTyped();
+}
+
+String[] bestPredictionsForSequence(String sequence, String previousWord)
+{
+  // Active word entry should rank single words only. Multiword segmentation is
+  // intentionally isolated so it cannot steal suggestion tiles mid-word.
+  return bestCandidatesForSequence(sequence, previousWord);
+}
+
+boolean shouldStayInsideCurrentWord(String sequence, String segmentedText)
+{
+  if (segmentedText == null || segmentedText.indexOf(' ') < 0)
+    return false;
+  if (sequenceBuckets.get(sequence) != null)
+    return false;
+
+  Long prefixCount = sequencePrefixCounts.get(sequence);
+  if (prefixCount == null)
+    return false;
+
+  return prefixCount.longValue() >= STRONG_PREFIX_COUNT || sequence.length() <= 4;
+}
+
+String[] bestSegmentationsForSequence(String sequence, String previousWord)
+{
+  String[] result = new String[CANDIDATE_SLOTS];
+  int n = sequence.length();
+  ArrayList[] paths = new ArrayList[n + 1];
+  paths[0] = new ArrayList<SegPath>();
+  paths[0].add(new SegPath("", previousWord, 0, 0));
+
+  for (int start = 0; start < n; start++)
+  {
+    if (paths[start] == null)
+      continue;
+
+    int maxLen = min(MAX_WORD_DIGITS, n - start);
+    for (int len = 1; len <= maxLen; len++)
+    {
+      int end = start + len;
+      String segment = sequence.substring(start, end);
+      CandidateBucket bucket = sequenceBuckets.get(segment);
+      if (bucket == null)
+        continue;
+
+      for (int pathIndex = 0; pathIndex < paths[start].size(); pathIndex++)
+      {
+        SegPath path = (SegPath)paths[start].get(pathIndex);
+        for (int wordIndex = 0; wordIndex < bucket.words.length; wordIndex++)
+        {
+          String word = bucket.words[wordIndex];
+          if (word == null)
+            continue;
+
+          float score = path.score + scoreSegmentWord(word, segment, bucket.counts[wordIndex], path.lastWord, path.wordCount > 0, start == 0 && end == n);
+          String text = path.text.length() == 0 ? word : path.text + " " + word;
+          addSegPath(paths, end, new SegPath(text, word, score, path.wordCount + 1), SEGMENT_BEAM_WIDTH);
+        }
+      }
+    }
+  }
+
+  if (paths[n] == null)
+    return emptyPredictionList();
+
+  for (int i = 0; i < min(CANDIDATE_SLOTS, paths[n].size()); i++)
+    result[i] = ((SegPath)paths[n].get(i)).text;
+
+  for (int i = 0; i < result.length; i++)
+  {
+    if (result[i] == null)
+      result[i] = "";
+  }
+  return result;
+}
+
+float scoreSegmentWord(String word, String sequence, long count, String previousWord, boolean startsNewWord, boolean consumesWholeInput)
+{
+  float score = logScore(count) * UNIGRAM_SCORE_MULTIPLIER;
+  score += min(word.length(), MAX_WORD_DIGITS) * WORD_LENGTH_BONUS;
+  if (word.equals("a") || word.equals("i"))
+    score += ONE_LETTER_WORD_BONUS;
+
+  if (previousWord != null && previousWord.length() > 0)
+  {
+    CandidateBucket contextBucket = contextSequenceBuckets.get(contextKey(previousWord, sequence));
+    if (contextBucket != null)
+    {
+      long contextCount = contextBucket.countFor(word);
+      if (contextCount > 0)
+        score += logScore(contextCount) * CONTEXT_SCORE_MULTIPLIER;
+    }
+  }
+
+  if (startsNewWord)
+    score -= WORD_BREAK_PENALTY;
+
+  if (consumesWholeInput)
+    score += WHOLE_INPUT_WORD_BONUS;
+
+  return score;
+}
+
+void addSegPath(ArrayList[] paths, int index, SegPath candidate, int limit)
+{
+  if (paths[index] == null)
+    paths[index] = new ArrayList<SegPath>();
+
+  ArrayList list = paths[index];
+  for (int i = 0; i < list.size(); i++)
+  {
+    SegPath existing = (SegPath)list.get(i);
+    if (existing.text.equals(candidate.text))
+    {
+      if (candidate.score > existing.score)
+      {
+        list.set(i, candidate);
+        sortSegPaths(list);
       }
       return;
     }
   }
 
-  // Letter-group keys
-  float kW = sizeOfInputArea / 3.0;
-  for (int r = 0; r < 2; r++) {
-    for (int c = 0; c < 3; c++) {
-      int idx = r*3 + c;
-      float x = inputLeft + c*kW;
-      float y = inputTop + suggH + r*letterH;
-      if (didMouseClick(x, y, kW, letterH)) {
-        groupSeq.add(idx);
-        lastKeyFlashed = idx;
-        lastSpecialFlash = 0;
-        lastKeyFlashTime = millis();
-        updateSuggestions();
-        return;
+  list.add(candidate);
+  sortSegPaths(list);
+  while (list.size() > limit)
+    list.remove(list.size() - 1);
+}
+
+void sortSegPaths(ArrayList list)
+{
+  for (int i = 0; i < list.size(); i++)
+  {
+    for (int j = i + 1; j < list.size(); j++)
+    {
+      SegPath a = (SegPath)list.get(i);
+      SegPath b = (SegPath)list.get(j);
+      if (b.score > a.score)
+      {
+        list.set(i, b);
+        list.set(j, a);
       }
     }
   }
+}
 
-  // Space / delete
-  float by = inputTop + suggH + 2*letterH;
-  float spaceW = sizeOfInputArea * (2.0/3.0);
-  float delW = sizeOfInputArea - spaceW;
-  if (didMouseClick(inputLeft, by, spaceW, bottomH)) {
-    // Space: commit top suggestion if we're mid-word; else insert a space.
-    if (groupSeq.size() > 0) {
-      String commit = (currentSuggestions[0] != null && currentSuggestions[0].length() > 0)
-                        ? currentSuggestions[0]
-                        : rawFirstLetters();
-      currentTyped += commit + " ";
-      lastCommittedWord = commit;
-      groupSeq.clear();
-    } else {
-      currentTyped += " ";
-      lastCommittedWord = "";
-    }
-    lastSpecialFlash = 1;
-    lastKeyFlashed = -1;
-    lastKeyFlashTime = millis();
-    updateSuggestions();
-    return;
+String[] emptyPredictionList()
+{
+  String[] result = new String[CANDIDATE_SLOTS];
+  for (int i = 0; i < result.length; i++)
+    result[i] = "";
+  return result;
+}
+
+String[] bestCandidatesForSequence(String sequence, String previousWord)
+{
+  String[] result = new String[CANDIDATE_SLOTS];
+  float[] scores = new float[CANDIDATE_SLOTS];
+  for (int i = 0; i < scores.length; i++)
+    scores[i] = -999999;
+
+  String typed = sequence == null ? "" : sequence.toLowerCase();
+  String context = previousWord == null ? "" : previousWord.toLowerCase();
+  HashMap<String, Boolean> candidates = new HashMap<String, Boolean>();
+  collectJointCandidates(candidates, typed, context);
+
+  for (String word : candidates.keySet())
+    insertScoredCandidate(result, scores, word, scoreCandidate(word, typed, context));
+
+  if (result[0] == null)
+  {
+    addCandidateBucket(candidates, fallbackPredictionBucket);
+
+    for (String word : candidates.keySet())
+      insertScoredCandidate(result, scores, word, scoreCandidate(word, typed, context));
   }
-  if (didMouseClick(inputLeft + spaceW, by, delW, bottomH)) {
-    if (groupSeq.size() > 0) {
-      groupSeq.remove(groupSeq.size() - 1);
-    } else if (currentTyped.length() > 0) {
-      currentTyped = currentTyped.substring(0, currentTyped.length()-1);
-      String trimmed = currentTyped.trim();
-      int sp = trimmed.lastIndexOf(' ');
-      lastCommittedWord = (sp >= 0) ? trimmed.substring(sp+1) : trimmed;
-    }
-    lastSpecialFlash = 2;
-    lastKeyFlashed = -1;
-    lastKeyFlashTime = millis();
-    updateSuggestions();
+
+  for (int i = 0; i < result.length; i++)
+  {
+    if (result[i] == null)
+      result[i] = "";
+  }
+  return result;
+}
+
+String[] computeVisibleSuggestions()
+{
+  return bestCandidatesForSequence(currentWordPrefix(), previousContextWord());
+}
+
+void collectJointCandidates(HashMap<String, Boolean> candidates, String typed, String previousWord)
+{
+  String sequence = candidateSequenceForTyped(typed);
+  if (sequence.length() == 0)
     return;
+
+  addSequenceCandidateBuckets(candidates, sequence, previousWord);
+  addSkeletonCandidateBuckets(candidates, sequence);
+  addNearSequenceCandidates(candidates, sequence, previousWord);
+
+  if (candidates.size() < CANDIDATE_SLOTS)
+    addCandidateBucket(candidates, fallbackPredictionBucket);
+}
+
+void addSequenceCandidateBuckets(HashMap<String, Boolean> candidates, String sequence, String previousWord)
+{
+  addCandidateBucket(candidates, sequenceBuckets.get(sequence));
+  addCandidateBucket(candidates, prefixSequenceBuckets.get(sequence));
+
+  if (previousWord != null && previousWord.length() > 0)
+  {
+    addCandidateBucket(candidates, contextSequenceBuckets.get(contextKey(previousWord, sequence)));
+    addCandidateBucket(candidates, contextPrefixSequenceBuckets.get(contextKey(previousWord, sequence)));
+  }
+}
+
+void addSkeletonCandidateBuckets(HashMap<String, Boolean> candidates, String sequence)
+{
+  addCandidateBucket(candidates, skeletonSequenceBuckets.get(sequence));
+  addCandidateBucket(candidates, skeletonPrefixSequenceBuckets.get(sequence));
+}
+
+void addNearSequenceCandidates(HashMap<String, Boolean> candidates, String sequence, String previousWord)
+{
+  if (sequence.length() < 3)
+    return;
+
+  for (int i = 0; i < sequence.length(); i++)
+  {
+    String deletion = sequence.substring(0, i) + sequence.substring(i + 1);
+    if (deletion.length() > 0)
+      addExactSequenceCandidateBuckets(candidates, deletion, previousWord);
+
+    for (char digit = '2'; digit <= '9'; digit++)
+    {
+      if (digit == sequence.charAt(i))
+        continue;
+
+      String substitution = sequence.substring(0, i) + digit + sequence.substring(i + 1);
+      addExactSequenceCandidateBuckets(candidates, substitution, previousWord);
+    }
+  }
+
+  for (int i = 0; i <= sequence.length(); i++)
+  {
+    for (char digit = '2'; digit <= '9'; digit++)
+    {
+      String insertion = sequence.substring(0, i) + digit + sequence.substring(i);
+      addExactSequenceCandidateBuckets(candidates, insertion, previousWord);
+    }
+  }
+}
+
+void addExactSequenceCandidateBuckets(HashMap<String, Boolean> candidates, String sequence, String previousWord)
+{
+  addCandidateBucket(candidates, sequenceBuckets.get(sequence));
+
+  if (previousWord != null && previousWord.length() > 0)
+    addCandidateBucket(candidates, contextSequenceBuckets.get(contextKey(previousWord, sequence)));
+}
+
+void addCandidateBucket(HashMap<String, Boolean> candidates, CandidateBucket bucket)
+{
+  if (bucket == null)
+    return;
+
+  for (int i = 0; i < bucket.words.length; i++)
+  {
+    String word = bucket.words[i];
+    if (word != null && word.length() > 0)
+      candidates.put(word, true);
+  }
+}
+
+String[] bestNextWordCandidates(String previousWord)
+{
+  String[] result = new String[CANDIDATE_SLOTS];
+  float[] scores = new float[CANDIDATE_SLOTS];
+  for (int i = 0; i < scores.length; i++)
+    scores[i] = -999999;
+
+  String context = previousWord == null ? "" : previousWord.toLowerCase();
+  HashMap<String, Boolean> candidates = new HashMap<String, Boolean>();
+  if (context.length() > 0)
+    addCandidateBucket(candidates, nextWordBuckets.get(context));
+  addCandidateBucket(candidates, fallbackPredictionBucket);
+
+  for (String word : candidates.keySet())
+  {
+    float score = JOINT_UNIGRAM_WEIGHT * unigramScore(word);
+    score += JOINT_BIGRAM_WEIGHT * bigramScore(word, context);
+    score += JOINT_CHAR_NGRAM_WEIGHT * charNgramScore(word, "");
+    insertScoredCandidate(result, scores, word, score);
+  }
+
+  for (int i = 0; i < result.length; i++)
+  {
+    if (result[i] == null)
+      result[i] = "";
+  }
+  return result;
+}
+
+float scoreCandidate(String word, String typed, String previousWord)
+{
+  String typedDigits = candidateSequenceForTyped(typed);
+  String wordDigits = t9SequenceForWord(word);
+  if (typedDigits.length() == 0 || wordDigits.length() == 0)
+    return -999999;
+
+  // Clean digit-first scoring: frequency and context help, but the typed digit
+  // sequence is the primary evidence. Prefix and skeleton are light support.
+  float score = JOINT_UNIGRAM_WEIGHT * unigramScore(word);
+  score += JOINT_BIGRAM_WEIGHT * bigramScore(word, previousWord);
+  score += JOINT_PREFIX_WEIGHT * exactPrefixMatchScore(wordDigits, typedDigits);
+  score += JOINT_CHAR_NGRAM_WEIGHT * charNgramScore(word, typed);
+  score -= JOINT_EDIT_PENALTY_WEIGHT * digitEditDistance(typedDigits, wordDigits);
+  score -= JOINT_SKELETON_WEIGHT * skeletonDistance(word, typedDigits);
+  return score;
+}
+
+float unigramScore(String word)
+{
+  Long count = unigramCounts.get(word);
+  if (count == null)
+    return 0;
+
+  float score = min(logScore(count.longValue()), UNIGRAM_LOG_CAP);
+  Long commonCount = commonWordCounts.get(word);
+  if (commonCount != null)
+    score += COMMON_WORD_SCORE_WEIGHT * logScore(commonCount.longValue());
+  return score;
+}
+
+float bigramScore(String word, String previousWord)
+{
+  if (previousWord == null || previousWord.length() == 0)
+    return 0;
+
+  Long count = bigramCounts.get(contextKey(previousWord, word));
+  if (count == null)
+    return (float)Math.log(BIGRAM_SMOOTHING);
+  return min((float)Math.log(count.longValue() + BIGRAM_SMOOTHING), BIGRAM_LOG_CAP);
+}
+
+float exactPrefixMatchScore(String wordDigits, String typedDigits)
+{
+  if (wordDigits == null || typedDigits == null || typedDigits.length() == 0)
+    return 0;
+
+  if (wordDigits.equals(typedDigits))
+    return 1.20;
+
+  if (wordDigits.startsWith(typedDigits))
+    return 0.30;
+
+  return 0;
+}
+
+float skeletonMatchScore(String word, String typed)
+{
+  if (typed == null || typed.length() == 0)
+    return 0;
+
+  String wordSkeleton = simplifyWord(word);
+  if (wordSkeleton.length() >= word.length())
+    return 0;
+
+  String typedDigits = candidateSequenceForTyped(typed);
+  String comparison = t9SequenceForWord(wordSkeleton);
+
+  if (comparison.equals(typedDigits))
+    return 0.50;
+
+  if (comparison.startsWith(typedDigits))
+    return 0.20;
+
+  if (typedDigits.length() >= 3 && isSubsequence(typedDigits, comparison))
+    return 0.10;
+
+  return 0;
+}
+
+float editPenalty(String word, String typed)
+{
+  return digitEditDistance(candidateSequenceForTyped(typed), t9SequenceForWord(word));
+}
+
+float digitEditDistance(String typedDigits, String wordDigits)
+{
+  if (typedDigits == null || typedDigits.length() == 0)
+    return 0;
+  if (wordDigits == null || wordDigits.length() == 0)
+    return typedDigits.length();
+
+  if (wordDigits.startsWith(typedDigits))
+    return max(0, wordDigits.length() - typedDigits.length()) * PREFIX_EXTENSION_DIGIT_COST;
+
+  String comparable = wordDigits;
+  if (wordDigits.length() > typedDigits.length())
+    comparable = wordDigits.substring(0, typedDigits.length());
+
+  float prefixDistance = digitLevenshteinDistance(typedDigits, comparable);
+  prefixDistance += max(0, wordDigits.length() - typedDigits.length()) * PREFIX_EXTENSION_DIGIT_COST;
+  float fullDistance = digitLevenshteinDistance(typedDigits, wordDigits);
+  return min(prefixDistance, fullDistance);
+}
+
+float digitLevenshteinDistance(String a, String b)
+{
+  float[][] distance = new float[a.length() + 1][b.length() + 1];
+  for (int i = 0; i <= a.length(); i++)
+    distance[i][0] = i;
+  for (int j = 0; j <= b.length(); j++)
+    distance[0][j] = j;
+
+  for (int i = 1; i <= a.length(); i++)
+  {
+    for (int j = 1; j <= b.length(); j++)
+    {
+      float substitution = a.charAt(i - 1) == b.charAt(j - 1) ? 0 : 1;
+      distance[i][j] = min(min(distance[i - 1][j] + 1, distance[i][j - 1] + 1), distance[i - 1][j - 1] + substitution);
+    }
+  }
+  return distance[a.length()][b.length()];
+}
+
+float skeletonDistance(String word, String typedDigits)
+{
+  if (word == null || typedDigits == null || typedDigits.length() == 0)
+    return 0;
+
+  String wordSkeleton = simplifyWord(word);
+  if (wordSkeleton.length() == 0 || wordSkeleton.length() >= word.length())
+    return 0;
+
+  String wordDigits = t9SequenceForWord(word);
+  if (wordDigits.equals(typedDigits) || wordDigits.startsWith(typedDigits))
+    return 0;
+
+  String skeletonDigits = t9SequenceForWord(wordSkeleton);
+  if (skeletonDigits.length() == 0)
+    return 0;
+
+  return digitEditDistance(typedDigits, skeletonDigits);
+}
+
+float charNgramScore(String word, String typed)
+{
+  if (letterNgramScores.size() == 0 || word == null || word.length() < 2)
+    return 0;
+
+  float total = 0;
+  int pieces = 0;
+  String lower = word.toLowerCase();
+
+  for (int i = 0; i <= lower.length() - 2; i++)
+  {
+    Float score = letterNgramScores.get(lower.substring(i, i + 2));
+    if (score != null)
+    {
+      total += score.floatValue() * 0.45;
+      pieces++;
+    }
+  }
+
+  for (int i = 0; i <= lower.length() - 3; i++)
+  {
+    Float score = letterNgramScores.get(lower.substring(i, i + 3));
+    if (score != null)
+    {
+      total += score.floatValue() * 0.70;
+      pieces++;
+    }
+  }
+
+  if (pieces == 0)
+    return 0;
+  return total / pieces;
+}
+
+String comparisonStringForWord(String word, String typed)
+{
+  if (isDigitSequence(typed))
+    return t9SequenceForWord(word);
+  return word == null ? "" : word.toLowerCase();
+}
+
+String candidateSequenceForTyped(String typed)
+{
+  if (typed == null)
+    return "";
+  String normalized = typed.toLowerCase();
+  if (isDigitSequence(normalized))
+    return normalized;
+  if (isLowerAlphaWord(normalized))
+    return t9SequenceForWord(normalized);
+  return "";
+}
+
+boolean isDigitSequence(String value)
+{
+  if (value == null || value.length() == 0)
+    return false;
+
+  for (int i = 0; i < value.length(); i++)
+  {
+    char c = value.charAt(i);
+    if (c < '2' || c > '9')
+      return false;
+  }
+  return true;
+}
+
+String currentWordPrefix()
+{
+  if (t9Sequence.length() > 0)
+    return t9Sequence;
+  if (committedTyped.length() > 0 && committedTyped.charAt(committedTyped.length() - 1) != ' ')
+    return lastWordOf(committedTyped);
+  return "";
+}
+
+String simplifyWord(String word)
+{
+  if (word == null)
+    return "";
+
+  String lower = word.toLowerCase();
+  String simplified = "";
+  char lastKept = 0;
+  for (int i = 0; i < lower.length(); i++)
+  {
+    char c = lower.charAt(i);
+    if (c < 'a' || c > 'z')
+      continue;
+
+    if (i > 0 && isVowel(c))
+      continue;
+
+    if (c == lastKept)
+      continue;
+
+    simplified += c;
+    lastKept = c;
+  }
+  return simplified;
+}
+
+boolean isSubsequence(String shortText, String longText)
+{
+  if (shortText == null || longText == null)
+    return false;
+
+  int shortIndex = 0;
+  for (int i = 0; i < longText.length() && shortIndex < shortText.length(); i++)
+  {
+    if (shortText.charAt(shortIndex) == longText.charAt(i))
+      shortIndex++;
+  }
+  return shortIndex == shortText.length();
+}
+
+String previousContextWord()
+{
+  if (committedTyped.length() == 0)
+    return "";
+
+  int end = committedTyped.length() - 1;
+  while (end >= 0 && committedTyped.charAt(end) == ' ')
+    end--;
+
+  if (end < 0)
+    return "";
+
+  if (t9Sequence.length() == 0 && committedTyped.charAt(committedTyped.length() - 1) != ' ')
+  {
+    while (end >= 0 && committedTyped.charAt(end) != ' ')
+      end--;
+    while (end >= 0 && committedTyped.charAt(end) == ' ')
+      end--;
+    if (end < 0)
+      return "";
+  }
+
+  int start = end;
+  while (start >= 0 && committedTyped.charAt(start) != ' ')
+    start--;
+
+  return committedTyped.substring(start + 1, end + 1).toLowerCase();
+}
+
+void fillNextWordPredictions()
+{
+  fillCurrentTypingPredictions(bestNextWordCandidates(previousContextWord()));
+}
+
+void fillCurrentTypingPredictions(String[] candidates)
+{
+  if (candidates == null || candidates.length == 0)
+    return;
+
+  for (int i = 0; i < candidates.length; i++)
+    addVisibleCandidate(candidates[i]);
+}
+
+void fillCandidatesFromBucket(CandidateBucket bucket)
+{
+  if (bucket == null)
+    return;
+
+  for (int i = 0; i < bucket.words.length; i++)
+  {
+    if (bucket.words[i] != null && bucket.words[i].length() > 0)
+      addVisibleCandidate(bucket.words[i]);
+  }
+}
+
+void addVisibleCandidate(String candidate)
+{
+  if (candidate == null || candidate.length() == 0)
+    return;
+
+  for (int i = 0; i < visibleCandidates.length; i++)
+  {
+    if (candidate.equals(visibleCandidates[i]))
+      return;
+  }
+
+  for (int i = 0; i < visibleCandidates.length; i++)
+  {
+    if (visibleCandidates[i] == null || visibleCandidates[i].length() == 0)
+    {
+      visibleCandidates[i] = candidate;
+      return;
+    }
+  }
+}
+
+String lastWordOf(String text)
+{
+  if (text == null)
+    return "";
+
+  String cleaned = text.trim().toLowerCase();
+  if (cleaned.length() == 0)
+    return "";
+
+  int end = cleaned.length() - 1;
+  while (end >= 0 && cleaned.charAt(end) == ' ')
+    end--;
+  if (end < 0)
+    return "";
+
+  int start = end;
+  while (start >= 0 && cleaned.charAt(start) != ' ')
+    start--;
+
+  return cleaned.substring(start + 1, end + 1);
+}
+
+void addBucketScores(HashMap<String, Float> scoreMap, CandidateBucket bucket, float multiplier, boolean addExactBonus)
+{
+  if (bucket == null)
+    return;
+
+  for (int i = 0; i < bucket.words.length; i++)
+  {
+    String word = bucket.words[i];
+    if (word == null || word.length() == 0)
+      continue;
+
+    float score = logScore(bucket.counts[i]) * multiplier;
+    if (addExactBonus)
+      score += exactCandidateBonus(word);
+    Float current = scoreMap.get(word);
+    if (current == null)
+      scoreMap.put(word, score);
+    else
+      scoreMap.put(word, current + score);
+  }
+}
+
+void addPrefixBucketScores(HashMap<String, Float> scoreMap, CandidateBucket bucket, float multiplier, String typedSequence)
+{
+  if (bucket == null)
+    return;
+
+  for (int i = 0; i < bucket.words.length; i++)
+  {
+    String word = bucket.words[i];
+    if (word == null || word.length() == 0)
+      continue;
+
+    float extraLetters = max(0, word.length() - typedSequence.length());
+    float score = logScore(bucket.counts[i]) * multiplier - extraLetters * PREFIX_EXTRA_LETTER_PENALTY;
+    Float current = scoreMap.get(word);
+    if (current == null)
+      scoreMap.put(word, score);
+    else
+      scoreMap.put(word, current + score);
+  }
+}
+
+float exactCandidateBonus(String word)
+{
+  if (word != null && word.length() <= 3)
+    return SHORT_EXACT_WORD_BONUS;
+  return EXACT_WORD_SCORE_BONUS;
+}
+
+void fillRemainingPrefixCandidates(String[] result, CandidateBucket bucket, String typedSequence)
+{
+  if (bucket == null)
+    return;
+
+  String[] prefixWords = new String[CANDIDATE_SLOTS];
+  float[] prefixScores = new float[CANDIDATE_SLOTS];
+  for (int i = 0; i < prefixScores.length; i++)
+    prefixScores[i] = -1;
+
+  for (int i = 0; i < bucket.words.length; i++)
+  {
+    String word = bucket.words[i];
+    if (word == null || word.length() == 0)
+      continue;
+    if (candidateAlreadyPresent(result, word))
+      continue;
+
+    float extraLetters = max(0, word.length() - typedSequence.length());
+    float score = logScore(bucket.counts[i]) * prefixScoreMultiplier(typedSequence) - extraLetters * PREFIX_EXTRA_LETTER_PENALTY;
+    insertScoredCandidate(prefixWords, prefixScores, word, score);
+  }
+
+  for (int i = 0; i < prefixWords.length; i++)
+  {
+    if (prefixWords[i] != null && prefixWords[i].length() > 0)
+      appendCandidate(result, prefixWords[i]);
+  }
+}
+
+float prefixScoreMultiplier(String sequence)
+{
+  if (sequence != null && sequence.length() == 1)
+    return SINGLE_GROUP_PREFIX_MULTIPLIER;
+  return PREFIX_SCORE_MULTIPLIER;
+}
+
+boolean candidateAlreadyPresent(String[] words, String word)
+{
+  if (word == null)
+    return false;
+
+  for (int i = 0; i < words.length; i++)
+  {
+    if (word.equals(words[i]))
+      return true;
+  }
+  return false;
+}
+
+void appendCandidate(String[] words, String word)
+{
+  if (word == null || word.length() == 0 || candidateAlreadyPresent(words, word))
+    return;
+
+  for (int i = 0; i < words.length; i++)
+  {
+    if (words[i] == null || words[i].length() == 0)
+    {
+      words[i] = word;
+      return;
+    }
+  }
+}
+
+void insertScoredCandidate(String[] words, float[] scores, String word, float score)
+{
+  if (word == null || word.length() == 0)
+    return;
+
+  for (int i = 0; i < words.length; i++)
+  {
+    if (word.equals(words[i]))
+    {
+      if (score > scores[i])
+        scores[i] = score;
+      sortCandidateArrays(words, scores);
+      return;
+    }
+  }
+
+  for (int i = 0; i < words.length; i++)
+  {
+    if (words[i] == null || score > scores[i])
+    {
+      for (int j = words.length - 1; j > i; j--)
+      {
+        words[j] = words[j - 1];
+        scores[j] = scores[j - 1];
+      }
+      words[i] = word;
+      scores[i] = score;
+      return;
+    }
+  }
+}
+
+void sortCandidateArrays(String[] words, float[] scores)
+{
+  for (int i = 0; i < scores.length; i++)
+  {
+    for (int j = i + 1; j < scores.length; j++)
+    {
+      if (scores[j] > scores[i])
+      {
+        float scoreSwap = scores[i];
+        scores[i] = scores[j];
+        scores[j] = scoreSwap;
+
+        String wordSwap = words[i];
+        words[i] = words[j];
+        words[j] = wordSwap;
+      }
+    }
+  }
+}
+
+void clearVisibleCandidates()
+{
+  for (int i = 0; i < visibleCandidates.length; i++)
+    visibleCandidates[i] = "";
+}
+
+int visibleCandidateCount()
+{
+  int count = 0;
+  for (int i = 0; i < visibleCandidates.length; i++)
+  {
+    if (visibleCandidates[i] != null && visibleCandidates[i].length() > 0)
+      count++;
+  }
+  return count;
+}
+
+void syncCurrentTyped()
+{
+  if (t9Sequence.length() > 0)
+    currentTyped = committedTyped + livePrediction;
+  else
+    currentTyped = committedTyped;
+}
+
+String previousCommittedWord()
+{
+  if (committedTyped.length() == 0)
+    return "";
+
+  int end = committedTyped.length() - 1;
+  while (end >= 0 && committedTyped.charAt(end) == ' ')
+    end--;
+
+  if (end < 0)
+    return "";
+
+  int start = end;
+  while (start >= 0 && committedTyped.charAt(start) != ' ')
+    start--;
+
+  return committedTyped.substring(start + 1, end + 1).toLowerCase();
+}
+
+String alternateCandidateLabel()
+{
+  String label = "";
+  for (int offset = 1; offset < visibleCandidates.length; offset++)
+  {
+    int i = (selectedCandidateIndex + offset) % visibleCandidates.length;
+    String candidate = visibleCandidates[i];
+    if (candidate == null || candidate.length() == 0)
+      continue;
+
+    if (label.length() > 0)
+      label += "  ";
+    label += candidate;
+  }
+  return label;
+}
+
+int hoveredAction()
+{
+  if (mousePressed)
+    return ACTION_NONE;
+  return touchActionAt(mouseX, mouseY);
+}
+
+int touchActionAt(float x, float y)
+{
+  return actionAt(x, y);
+}
+
+boolean actionEnabled(int action)
+{
+  if (action == ACTION_NONE)
+    return false;
+  if (isPredictionAction(action))
+    return predictionEnabled(action - ACTION_PREDICT_BASE);
+  return true;
+}
+
+int actionAt(float x, float y)
+{
+  if (!isInsideInput(x, y))
+    return ACTION_NONE;
+
+  if (y <= inputTop() + topStripHeight())
+  {
+    if (x >= inputLeft() && x < inputLeft() + keyboardCellWidth())
+      return ACTION_DELETE;
+
+    int predictionIndex = predictionIndexAt(x, y);
+    if (predictionIndex >= 0)
+      return ACTION_PREDICT_BASE + predictionIndex;
+    return ACTION_NONE;
+  }
+
+  int row = constrain((int)((y - keyboardTop()) / keyboardCellHeight()), 0, 2);
+  int col = constrain((int)((x - inputLeft()) / keyboardCellWidth()), 0, 2);
+  return keyboardActionAt(row, col);
+}
+
+int keyboardActionAt(int row, int col)
+{
+  if (row == 0)
+    return ACTION_T9_BASE + col;
+
+  if (row == 1)
+    return ACTION_T9_BASE + col + 3;
+
+  if (col == 0)
+    return ACTION_T9_BASE + 6;
+  if (col == 1)
+    return ACTION_SPACE;
+  return ACTION_T9_BASE + 7;
+}
+
+int homeButtonColor(int action, boolean enabled, boolean isHighlighted)
+{
+  if (!enabled)
+    return color(78);
+
+  if (isHighlighted)
+    return color(246, 206, 92);
+
+  if (action == ACTION_DELETE)
+    return color(118);
+  if (action == ACTION_SPACE)
+    return color(175);
+  if (isPredictionAction(action))
+    return color(88, 116, 132);
+  return color(90);
+}
+
+boolean isPredictionAction(int action)
+{
+  return action >= ACTION_PREDICT_BASE && action < ACTION_PREDICT_BASE + PREDICTION_TILE_COUNT;
+}
+
+boolean predictionEnabled(int index)
+{
+  return index >= 0 && index < visibleCandidates.length && visibleCandidates[index] != null && visibleCandidates[index].length() > 0;
+}
+
+int predictionIndexAt(float x, float y)
+{
+  if (x < predictionAreaLeft() || x > inputLeft() + sizeOfInputArea)
+    return -1;
+  if (y < inputTop() || y > inputTop() + topStripHeight())
+    return -1;
+
+  int col = constrain((int)((x - predictionAreaLeft()) / predictionTileWidth()), 0, 1);
+  int row = constrain((int)((y - inputTop()) / predictionTileHeight()), 0, 1);
+  int index = row * 2 + col;
+  if (index < 0 || index >= PREDICTION_TILE_COUNT)
+    return -1;
+  return index;
+}
+
+boolean isInsideInput(float x, float y)
+{
+  return x >= inputLeft() && x <= inputLeft() + sizeOfInputArea && y >= inputTop() && y <= inputTop() + sizeOfInputArea;
+}
+
+float inputLeft()
+{
+  return width / 2.0 - sizeOfInputArea / 2.0;
+}
+
+float inputTop()
+{
+  return height / 2.0 - sizeOfInputArea / 2.0;
+}
+
+float buttonInset()
+{
+  return 3;
+}
+
+float topStripHeight()
+{
+  return sizeOfInputArea * 0.30;
+}
+
+float keyboardTop()
+{
+  return inputTop() + topStripHeight();
+}
+
+float keyboardCellWidth()
+{
+  return sizeOfInputArea / 3.0;
+}
+
+float keyboardCellHeight()
+{
+  return (sizeOfInputArea - topStripHeight()) / 3.0;
+}
+
+float keyboardCellLeft(int col)
+{
+  return inputLeft() + col * keyboardCellWidth();
+}
+
+float keyboardCellTop(int row)
+{
+  return keyboardTop() + row * keyboardCellHeight();
+}
+
+float predictionAreaLeft()
+{
+  return inputLeft() + keyboardCellWidth();
+}
+
+float predictionAreaWidth()
+{
+  return sizeOfInputArea - keyboardCellWidth();
+}
+
+float predictionTileWidth()
+{
+  return predictionAreaWidth() / 2.0;
+}
+
+float predictionTileHeight()
+{
+  return topStripHeight() / 2.0;
+}
+
+float predictionTileLeft(int index)
+{
+  return predictionAreaLeft() + (index % 2) * predictionTileWidth();
+}
+
+float predictionTileTop(int index)
+{
+  return inputTop() + (index / 2) * predictionTileHeight();
+}
+
+int predictionTileLabelSize(String label)
+{
+  if (label == null)
+    return 7;
+  if (label.length() <= 4)
+    return 8;
+  if (label.length() <= 8)
+    return 7;
+  return 6;
+}
+
+String fitLabel(String label, float maxWidth, int minSize)
+{
+  if (label == null || label.length() == 0)
+    return "";
+
+  textSize(minSize);
+  if (textWidth(label) <= maxWidth)
+    return label;
+
+  for (int keep = label.length() - 1; keep >= 2; keep--)
+  {
+    String candidate = label.substring(0, keep) + ".";
+    if (textWidth(candidate) <= maxWidth)
+      return candidate;
+  }
+
+  return label.substring(0, 1);
+}
+
+void loadLanguageModel()
+{
+  println("Loading T9 language model...");
+  loadDictionaryWordSet();
+  loadSequenceBuckets();
+  loadCountBigWords();
+  loadDictionaryWords();
+  loadContextSequenceBuckets();
+  loadLetterNgrams();
+  println("Loaded " + sequenceBuckets.size() + " T9 sequences, " + prefixSequenceBuckets.size() + " prefix sequences, " + contextSequenceBuckets.size() + " context sequences, " + nextWordBuckets.size() + " next-word buckets, and " + letterNgramScores.size() + " letter n-grams.");
+}
+
+void loadDictionaryWordSet()
+{
+  rememberDictionaryWords("ngrams/TWL06.txt");
+  dictionaryWords.put("a", true);
+  dictionaryWords.put("i", true);
+}
+
+void rememberDictionaryWords(String path)
+{
+  BufferedReader reader = createReader(path);
+  String line = null;
+
+  try
+  {
+    if (reader == null)
+      return;
+
+    while ((line = reader.readLine()) != null)
+    {
+      String word = line.trim().toLowerCase();
+      if (isLowerAlphaWord(word))
+        dictionaryWords.put(word, true);
+    }
+  }
+  catch (Exception e)
+  {
+    println("Could not read dictionary word set from " + path);
+    e.printStackTrace();
+  }
+  finally
+  {
+    closeReader(reader);
+  }
+}
+
+void loadSequenceBuckets()
+{
+  BufferedReader reader = createReader("ngrams/count_1w.txt");
+  String line = null;
+  int loadedWords = 0;
+
+  try
+  {
+    if (reader == null)
+      return;
+
+    while ((line = reader.readLine()) != null && loadedWords < MAX_UNIGRAM_WORDS)
+    {
+      int tab = line.lastIndexOf('\t');
+      if (tab <= 0)
+        continue;
+
+      String word = line.substring(0, tab).trim().toLowerCase();
+      if (!isLowerAlphaWord(word))
+        continue;
+
+      long count = parseLongSafe(line.substring(tab + 1));
+      if (count <= 0)
+        continue;
+      if (!isTrustedPredictionWord(word))
+      {
+        if (count < MIN_TRUSTED_UNIGRAM_COUNT)
+          continue;
+        dictionaryWords.put(word, true);
+      }
+
+      rememberUnigramCount(word, count);
+      addWordCandidate(word, count);
+      addPluralVariantCandidate(word, count);
+
+      loadedWords++;
+    }
+  }
+  catch (Exception e)
+  {
+    println("Could not load count_1w.txt");
+    e.printStackTrace();
+  }
+  finally
+  {
+    closeReader(reader);
+  }
+}
+
+void loadCountBigWords()
+{
+  BufferedReader reader = createReader("ngrams/count_big.txt");
+  String line = null;
+
+  try
+  {
+    if (reader == null)
+      return;
+
+    while ((line = reader.readLine()) != null)
+    {
+      int tab = line.lastIndexOf('\t');
+      if (tab <= 0)
+        continue;
+
+      String word = line.substring(0, tab).trim().toLowerCase();
+      if (!isLowerAlphaWord(word))
+        continue;
+
+      long count = parseLongSafe(line.substring(tab + 1));
+      if (count <= 0)
+        continue;
+      if (!isTrustedPredictionWord(word))
+        continue;
+
+      long scaled = scaledCount(count, COUNT_BIG_MULTIPLIER);
+      rememberCommonWordCount(word, scaled);
+      addWordCandidate(word, scaled);
+    }
+  }
+  catch (Exception e)
+  {
+    println("Could not load count_big.txt");
+    e.printStackTrace();
+  }
+  finally
+  {
+    closeReader(reader);
+  }
+}
+
+void loadDictionaryWords()
+{
+  loadDictionaryFile("ngrams/TWL06.txt");
+}
+
+void loadDictionaryFile(String path)
+{
+  BufferedReader reader = createReader(path);
+  String line = null;
+
+  try
+  {
+    if (reader == null)
+      return;
+
+    while ((line = reader.readLine()) != null)
+    {
+      String word = line.trim().toLowerCase();
+      if (word.length() > MAX_DICTIONARY_WORD_LENGTH || !isLowerAlphaWord(word))
+        continue;
+
+      dictionaryWords.put(word, true);
+      rememberUnigramCount(word, DICTIONARY_WORD_COUNT);
+      addWordCandidate(word, DICTIONARY_WORD_COUNT);
+      addPluralVariantCandidate(word, DICTIONARY_WORD_COUNT);
+    }
+  }
+  catch (Exception e)
+  {
+    println("Could not load " + path);
+    e.printStackTrace();
+  }
+  finally
+  {
+    closeReader(reader);
+  }
+}
+
+void loadContextSequenceBuckets()
+{
+  BufferedReader reader = createReader("ngrams/count_2w.txt");
+  String line = null;
+
+  try
+  {
+    if (reader == null)
+      return;
+
+    while ((line = reader.readLine()) != null)
+    {
+      int tab = line.lastIndexOf('\t');
+      if (tab <= 0)
+        continue;
+
+      String pair = line.substring(0, tab).trim().toLowerCase();
+      int space = pair.indexOf(' ');
+      if (space <= 0 || space >= pair.length() - 1)
+        continue;
+      if (pair.indexOf(' ', space + 1) != -1)
+        continue;
+
+      String first = pair.substring(0, space);
+      String second = pair.substring(space + 1);
+      if (!isLowerAlphaWord(first) || !isLowerAlphaWord(second))
+        continue;
+      if (!isTrustedPredictionWord(first) || !isTrustedPredictionWord(second))
+        continue;
+
+      long count = parseLongSafe(line.substring(tab + 1));
+      if (count <= 0)
+        continue;
+
+      addContextCandidate(first, second, count);
+    }
+  }
+  catch (Exception e)
+  {
+    println("Could not load count_2w.txt");
+    e.printStackTrace();
+  }
+  finally
+  {
+    closeReader(reader);
+  }
+}
+
+void loadLetterNgrams()
+{
+  loadLetterNgramFile("ngrams/count_2l.txt", 2);
+  loadLetterNgramFile("ngrams/count_3l.txt", 3);
+}
+
+void loadLetterNgramFile(String path, int ngramLength)
+{
+  BufferedReader reader = createReader(path);
+  String line = null;
+
+  try
+  {
+    if (reader == null)
+      return;
+
+    while ((line = reader.readLine()) != null)
+    {
+      int tab = line.lastIndexOf('\t');
+      if (tab <= 0)
+        continue;
+
+      String ngram = line.substring(0, tab).trim().toLowerCase();
+      if (ngram.length() != ngramLength || !isLowerAlphaWord(ngram))
+        continue;
+
+      long count = parseLongSafe(line.substring(tab + 1));
+      if (count <= 0)
+        continue;
+
+      letterNgramScores.put(ngram, logScore(count));
+    }
+  }
+  catch (Exception e)
+  {
+    println("Could not load " + path);
+    e.printStackTrace();
+  }
+  finally
+  {
+    closeReader(reader);
+  }
+}
+
+void addWordCandidate(String word, long count)
+{
+  String sequence = t9SequenceForWord(word);
+  if (sequence.length() == word.length())
+  {
+    bucketFor(sequenceBuckets, sequence).consider(word, count);
+    fallbackPredictionBucket.consider(word, count);
+    rememberSequencePrefixes(sequence, count);
+    rememberPrefixCandidates(word, sequence, count);
+    rememberSkeletonCandidates(word, count);
+  }
+}
+
+void addPluralVariantCandidate(String word, long sourceCount)
+{
+  if (word == null || word.length() < 3 || word.length() >= MAX_DICTIONARY_WORD_LENGTH)
+    return;
+  if (sourceCount < MIN_PLURAL_SOURCE_COUNT)
+    return;
+  if (word.endsWith("s"))
+    return;
+
+  String plural = word + "s";
+  if (!isLowerAlphaWord(plural))
+    return;
+
+  long count = sourceCount / 8;
+  if (count < DICTIONARY_WORD_COUNT)
+    count = DICTIONARY_WORD_COUNT;
+  dictionaryWords.put(plural, true);
+  rememberUnigramCount(plural, count);
+  addWordCandidate(plural, count);
+}
+
+void addContextCandidate(String previousWord, String word, long count)
+{
+  rememberBigramCount(previousWord, word, count);
+  String sequence = t9SequenceForWord(word);
+  if (sequence.length() == word.length())
+  {
+    bucketFor(contextSequenceBuckets, contextKey(previousWord, sequence)).consider(word, count);
+    rememberContextPrefixCandidates(contextPrefixSequenceBuckets, previousWord, word, sequence, count);
+    bucketFor(nextWordBuckets, previousWord).consider(word, count);
+  }
+}
+
+void rememberUnigramCount(String word, long count)
+{
+  Long current = unigramCounts.get(word);
+  if (current == null || count > current.longValue())
+    unigramCounts.put(word, count);
+}
+
+void rememberCommonWordCount(String word, long count)
+{
+  Long current = commonWordCounts.get(word);
+  if (current == null || count > current.longValue())
+    commonWordCounts.put(word, count);
+}
+
+void rememberBigramCount(String previousWord, String word, long count)
+{
+  if (previousWord == null || previousWord.length() == 0 || word == null || word.length() == 0)
+    return;
+
+  String key = contextKey(previousWord, word);
+  Long current = bigramCounts.get(key);
+  if (current == null || count > current.longValue())
+    bigramCounts.put(key, count);
+}
+
+void rememberSkeletonCandidates(String word, long count)
+{
+  String skeleton = simplifyWord(word);
+  if (skeleton.length() >= word.length())
+    return;
+
+  String sequence = t9SequenceForWord(skeleton);
+  if (sequence.length() == 0)
+    return;
+
+  bucketFor(skeletonSequenceBuckets, sequence).consider(word, count);
+  for (int len = 1; len < sequence.length(); len++)
+  {
+    String prefix = sequence.substring(0, len);
+    bucketFor(skeletonPrefixSequenceBuckets, prefix).consider(word, count);
+  }
+}
+
+void rememberContextPrefixCandidates(HashMap<String, CandidateBucket> map, String context, String word, String sequence, long count)
+{
+  if (context == null || context.length() == 0)
+    return;
+
+  for (int len = 1; len < sequence.length(); len++)
+  {
+    String prefix = sequence.substring(0, len);
+    bucketFor(map, contextKey(context, prefix)).consider(word, count);
+  }
+}
+
+void rememberSequencePrefixes(String sequence, long count)
+{
+  for (int len = 1; len < sequence.length(); len++)
+  {
+    String prefix = sequence.substring(0, len);
+    Long current = sequencePrefixCounts.get(prefix);
+    if (current == null || count > current.longValue())
+      sequencePrefixCounts.put(prefix, count);
+  }
+}
+
+void rememberPrefixCandidates(String word, String sequence, long count)
+{
+  for (int len = 1; len < sequence.length(); len++)
+  {
+    String prefix = sequence.substring(0, len);
+    bucketFor(prefixSequenceBuckets, prefix).consider(word, count);
+  }
+}
+
+CandidateBucket bucketFor(HashMap<String, CandidateBucket> map, String key)
+{
+  CandidateBucket bucket = map.get(key);
+  if (bucket == null)
+  {
+    bucket = new CandidateBucket();
+    map.put(key, bucket);
+  }
+  return bucket;
+}
+
+String contextKey(String previousWord, String sequence)
+{
+  return previousWord + "|" + sequence;
+}
+
+String t9SequenceForWord(String word)
+{
+  String sequence = "";
+  for (int i = 0; i < word.length(); i++)
+  {
+    char digit = t9DigitForLetter(word.charAt(i));
+    if (digit == 0)
+      return "";
+    sequence += digit;
+  }
+  return sequence;
+}
+
+char t9DigitForLetter(char c)
+{
+  if (c == 'q' || c == 'w' || c == 'e') return '2';
+  if (c == 'r' || c == 't' || c == 'y') return '3';
+  if (c == 'u' || c == 'i' || c == 'o' || c == 'p') return '4';
+  if (c == 'a' || c == 's' || c == 'd') return '5';
+  if (c == 'f' || c == 'g' || c == 'h') return '6';
+  if (c == 'j' || c == 'k' || c == 'l') return '7';
+  if (c == 'z' || c == 'x' || c == 'c' || c == 'v') return '8';
+  if (c == 'b' || c == 'n' || c == 'm') return '9';
+  return 0;
+}
+
+String fallbackWordFromSequence(String sequence)
+{
+  String ngramGuess = fallbackWordFromLetterNgrams(sequence);
+  if (ngramGuess.length() > 0)
+    return ngramGuess;
+
+  String word = "";
+  for (int i = 0; i < sequence.length(); i++)
+  {
+    int keyIndex = sequence.charAt(i) - '2';
+    if (keyIndex >= 0 && keyIndex < T9_LETTERS.length)
+      word += T9_LETTERS[keyIndex].charAt(0);
+  }
+  return word;
+}
+
+String fallbackWordFromLetterNgrams(String sequence)
+{
+  if (sequence.length() == 0 || letterNgramScores.size() == 0)
+    return "";
+
+  String[] beamWords = new String[BEAM_WIDTH];
+  float[] beamScores = new float[BEAM_WIDTH];
+  beamWords[0] = "";
+  beamScores[0] = 0;
+  int beamCount = 1;
+
+  for (int i = 0; i < sequence.length(); i++)
+  {
+    int keyIndex = sequence.charAt(i) - '2';
+    if (keyIndex < 0 || keyIndex >= T9_LETTERS.length)
+      return "";
+
+    String letters = T9_LETTERS[keyIndex];
+    String[] nextWords = new String[BEAM_WIDTH];
+    float[] nextScores = new float[BEAM_WIDTH];
+    for (int j = 0; j < nextScores.length; j++)
+      nextScores[j] = -999999;
+
+    for (int beamIndex = 0; beamIndex < beamCount; beamIndex++)
+    {
+      String base = beamWords[beamIndex];
+      if (base == null)
+        continue;
+
+      for (int letterIndex = 0; letterIndex < letters.length(); letterIndex++)
+      {
+        char next = letters.charAt(letterIndex);
+        String candidate = base + next;
+        float score = beamScores[beamIndex] + letterTransitionScore(base, next);
+        insertBeamCandidate(nextWords, nextScores, candidate, score);
+      }
+    }
+
+    beamWords = nextWords;
+    beamScores = nextScores;
+    beamCount = 0;
+    for (int j = 0; j < beamWords.length; j++)
+    {
+      if (beamWords[j] != null)
+        beamCount++;
+    }
+  }
+
+  if (beamWords[0] == null)
+    return "";
+  return beamWords[0];
+}
+
+float letterTransitionScore(String prefix, char next)
+{
+  if (prefix.length() == 0)
+    return 0;
+
+  float score = -4.0;
+
+  String bigram = prefix.substring(prefix.length() - 1) + next;
+  Float bigramScore = letterNgramScores.get(bigram);
+  if (bigramScore != null)
+    score = bigramScore * 0.75;
+
+  if (prefix.length() >= 2)
+  {
+    String trigram = prefix.substring(prefix.length() - 2) + next;
+    Float trigramScore = letterNgramScores.get(trigram);
+    if (trigramScore != null)
+      score += trigramScore * 1.20;
+  }
+
+  if (isVowel(next))
+    score += 0.10;
+  return score;
+}
+
+boolean isVowel(char c)
+{
+  return c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u';
+}
+
+void insertBeamCandidate(String[] words, float[] scores, String word, float score)
+{
+  for (int i = 0; i < words.length; i++)
+  {
+    if (words[i] == null || score > scores[i])
+    {
+      for (int j = words.length - 1; j > i; j--)
+      {
+        words[j] = words[j - 1];
+        scores[j] = scores[j - 1];
+      }
+      words[i] = word;
+      scores[i] = score;
+      return;
+    }
+  }
+}
+
+boolean isLowerAlphaWord(String value)
+{
+  if (value == null || value.length() == 0)
+    return false;
+
+  for (int i = 0; i < value.length(); i++)
+  {
+    char c = value.charAt(i);
+    if (c < 'a' || c > 'z')
+      return false;
+  }
+  return true;
+}
+
+boolean isTrustedPredictionWord(String word)
+{
+  return dictionaryWords.size() == 0 || dictionaryWords.get(word) != null;
+}
+
+long scaledCount(long count, long multiplier)
+{
+  if (count > Long.MAX_VALUE / multiplier)
+    return Long.MAX_VALUE;
+  return count * multiplier;
+}
+
+long parseLongSafe(String value)
+{
+  try
+  {
+    return Long.parseLong(value.trim());
+  }
+  catch (Exception e)
+  {
+    return 0;
+  }
+}
+
+float logScore(long count)
+{
+  return (float)Math.log(count + 1.0);
+}
+
+void closeReader(BufferedReader reader)
+{
+  try
+  {
+    if (reader != null)
+      reader.close();
+  }
+  catch (Exception e)
+  {
   }
 }
 
 void nextTrial()
 {
-  if (currTrialNum >= totalTrialNum) return;
+  syncCurrentTyped();
 
-  if (startTime!=0 && finishTime==0)
+  if (currTrialNum >= totalTrialNum)
+    return;
+
+  if (startTime != 0 && finishTime == 0)
   {
-    // Flush any in-progress word so we don't lose taps on trial boundary.
-    String finalTyped = currentTyped;
-    if (groupSeq.size() > 0) {
-      String commit = (currentSuggestions[0] != null && currentSuggestions[0].length() > 0)
-                        ? currentSuggestions[0] : rawFirstLetters();
-      finalTyped += commit;
-    }
     System.out.println("==================");
-    System.out.println("Phrase " + (currTrialNum+1) + " of " + totalTrialNum);
+    System.out.println("Phrase " + (currTrialNum + 1) + " of " + totalTrialNum);
     System.out.println("Target phrase: " + currentPhrase);
     System.out.println("Phrase length: " + currentPhrase.length());
-    System.out.println("User typed: " + finalTyped);
-    System.out.println("User typed length: " + finalTyped.length());
-    System.out.println("Number of errors: " + computeLevenshteinDistance(finalTyped.trim(), currentPhrase.trim()));
-    System.out.println("Time taken on this trial: " + (millis()-lastTime));
-    System.out.println("Time taken since beginning: " + (millis()-startTime));
+    System.out.println("User typed: " + currentTyped);
+    System.out.println("User typed length: " + currentTyped.length());
+    System.out.println("Number of errors: " + computeLevenshteinDistance(currentTyped.trim(), currentPhrase.trim()));
+    System.out.println("Time taken on this trial: " + (millis() - lastTime));
+    System.out.println("Time taken since beginning: " + (millis() - startTime));
     System.out.println("==================");
     lettersExpectedTotal += currentPhrase.trim().length();
-    lettersEnteredTotal  += finalTyped.trim().length();
-    errorsTotal += computeLevenshteinDistance(finalTyped.trim(), currentPhrase.trim());
+    lettersEnteredTotal += currentTyped.trim().length();
+    errorsTotal += computeLevenshteinDistance(currentTyped.trim(), currentPhrase.trim());
   }
 
-  if (currTrialNum == totalTrialNum-1)
+  if (currTrialNum == totalTrialNum - 1)
   {
     finishTime = millis();
     System.out.println("==================");
@@ -460,54 +2263,151 @@ void nextTrial()
     System.out.println("Total letters expected: " + lettersExpectedTotal);
     System.out.println("Total errors entered: " + errorsTotal);
 
-    float wpm = (lettersEnteredTotal/5.0f)/((finishTime - startTime)/60000f);
-    float freebieErrors = lettersExpectedTotal*.05;
-    float penalty = max(errorsTotal-freebieErrors, 0) * .5f;
+    float wpm = (lettersEnteredTotal / 5.0f) / ((finishTime - startTime) / 60000f);
+    float freebieErrors = lettersExpectedTotal * .05f; 
+    float penalty = max(errorsTotal - freebieErrors, 0) * .5f;
 
     System.out.println("Raw WPM: " + wpm);
     System.out.println("Freebie errors: " + freebieErrors);
     System.out.println("Penalty: " + penalty);
-    System.out.println("WPM w/ penalty: " + (wpm-penalty));
+    System.out.println("WPM w/ penalty: " + (wpm - penalty));
     System.out.println("==================");
+
     currTrialNum++;
     return;
   }
 
-  if (startTime == 0) {
+  if (startTime == 0)
+  {
     System.out.println("Trials beginning! Starting timer...");
     startTime = millis();
-  } else {
-    currTrialNum++;
   }
+  else
+    currTrialNum++;
 
   lastTime = millis();
+  committedTyped = "";
+  t9Sequence = "";
+  livePrediction = "";
+  clearVisibleCandidates();
   currentTyped = "";
-  groupSeq.clear();
-  lastCommittedWord = "";
-  updateSuggestions();
   currentPhrase = phrases[currTrialNum];
 }
 
 void drawWatch()
 {
-  float watchscale = DPIofYourDeviceScreen/138.0;
+  float watchscale = DPIofYourDeviceScreen / 138.0;
   pushMatrix();
-  translate(width/2, height/2);
+  translate(width / 2.0, height / 2.0); 
   scale(watchscale);
   imageMode(CENTER);
   image(watch, 0, 0);
   popMatrix();
 }
 
-//=========SHOULD NOT NEED TO TOUCH THIS METHOD AT ALL!==============
 int computeLevenshteinDistance(String phrase1, String phrase2)
 {
   int[][] distance = new int[phrase1.length() + 1][phrase2.length() + 1];
-  for (int i = 0; i <= phrase1.length(); i++) distance[i][0] = i;
-  for (int j = 1; j <= phrase2.length(); j++) distance[0][j] = j;
+
+  for (int i = 0; i <= phrase1.length(); i++)
+    distance[i][0] = i;
+  for (int j = 1; j <= phrase2.length(); j++)
+    distance[0][j] = j;
+
   for (int i = 1; i <= phrase1.length(); i++)
     for (int j = 1; j <= phrase2.length(); j++)
-      distance[i][j] = min(min(distance[i - 1][j] + 1, distance[i][j - 1] + 1),
-                           distance[i - 1][j - 1] + ((phrase1.charAt(i - 1) == phrase2.charAt(j - 1)) ? 0 : 1));
+      distance[i][j] = min(min(distance[i - 1][j] + 1, distance[i][j - 1] + 1), distance[i - 1][j - 1] + ((phrase1.charAt(i - 1) == phrase2.charAt(j - 1)) ? 0 : 1));
+
   return distance[phrase1.length()][phrase2.length()];
+}
+
+class CandidateBucket
+{
+  String[] words = new String[BUCKET_CAPACITY];
+  long[] counts = new long[BUCKET_CAPACITY];
+
+  void consider(String word, long count)
+  {
+    if (word == null || word.length() == 0)
+      return;
+
+    for (int i = 0; i < words.length; i++)
+    {
+      if (word.equals(words[i]))
+      {
+        if (count > counts[i])
+        {
+          counts[i] = count;
+          bubbleUp(i);
+        }
+        return;
+      }
+    }
+
+    for (int i = 0; i < words.length; i++)
+    {
+      if (words[i] == null || count > counts[i])
+      {
+        shiftDownFrom(i);
+        words[i] = word;
+        counts[i] = count;
+        return;
+      }
+    }
+  }
+
+  void shiftDownFrom(int index)
+  {
+    for (int i = words.length - 1; i > index; i--)
+    {
+      words[i] = words[i - 1];
+      counts[i] = counts[i - 1];
+    }
+  }
+
+  void bubbleUp(int index)
+  {
+    for (int i = index; i > 0; i--)
+    {
+      if (counts[i] <= counts[i - 1])
+        return;
+
+      String wordSwap = words[i];
+      words[i] = words[i - 1];
+      words[i - 1] = wordSwap;
+
+      long countSwap = counts[i];
+      counts[i] = counts[i - 1];
+      counts[i - 1] = countSwap;
+    }
+  }
+
+  long countFor(String word)
+  {
+    if (word == null)
+      return 0;
+
+    for (int i = 0; i < words.length; i++)
+    {
+      if (word.equals(words[i]))
+        return counts[i];
+    }
+    return 0;
+  }
+}
+
+class SegPath
+{
+  String text;
+  String lastWord;
+  float score;
+  int wordCount;
+
+  SegPath(String text, String lastWord, float score, int wordCount)
+  {
+    this.text = text;
+    this.lastWord = lastWord;
+    this.score = score;
+    this.wordCount = wordCount;
+  }
 }
