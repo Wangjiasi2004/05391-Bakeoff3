@@ -38,13 +38,13 @@ final String[] T9_DIGITS = {
 final String[] T9_LABELS = {
   "QWE", "RTY", "UIOP",
   "ASD", "FGH", "JKL",
-  "ZXC", "VBNM"
+  "ZXCV", "BNM"
 };
 
 final String[] T9_LETTERS = {
   "qwe", "rty", "uiop",
   "asd", "fgh", "jkl",
-  "zxc", "vbnm"
+  "zxcv", "bnm"
 };
 
 final int ACTION_NONE = 0;
@@ -1562,7 +1562,6 @@ String t9SequenceForWord(String word)
   return sequence;
 }
 
-// Mapped to QWERTY groupings!
 char t9DigitForLetter(char c)
 {
   if (c == 'q' || c == 'w' || c == 'e') return '2';
@@ -1571,8 +1570,8 @@ char t9DigitForLetter(char c)
   if (c == 'a' || c == 's' || c == 'd') return '5';
   if (c == 'f' || c == 'g' || c == 'h') return '6';
   if (c == 'j' || c == 'k' || c == 'l') return '7';
-  if (c == 'z' || c == 'x' || c == 'c') return '8';
-  if (c == 'v' || c == 'b' || c == 'n' || c == 'm') return '9';
+  if (c == 'z' || c == 'x' || c == 'c' || c == 'v') return '8';
+  if (c == 'b' || c == 'n' || c == 'm') return '9';
   return 0;
 }
 
